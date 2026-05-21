@@ -20,6 +20,8 @@ from .convolution import *
 from .pooling import *
 from .activation_base import *
 from .activations import *
+from .aten_fallback import *
+from .complex_pair import *
 from .s_shaped import *
 from .relu import *
 from .bivariate import *

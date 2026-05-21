@@ -18,6 +18,7 @@ from .bound_ops import *
 
 bound_op_map = {
     'onnx::Gemm': BoundLinear,
+    'custom::Assign': BoundAssign,
     'prim::Constant': BoundPrimConstant,
     'grad::Concat': BoundConcatGrad,
     'grad::Relu': BoundReluGrad,

@@ -42,8 +42,17 @@ def IBP_general(self: 'BoundedModule', node=None, C=None,
             return res
 
     if not node.perturbed:
-        fv = self.get_forward_value(node)
-        node.lower, node.upper = node.interval = (fv, fv)
+        # ``prim::ListConstruct`` for ``aten::einsum`` operands: keep
+        # ``perturbed=False`` but still box tensor intervals from inputs.
+        if type(node).__name__ == 'BoundPrimListConstruct' and any(
+                getattr(inp, 'perturbed', False) for inp in node.inputs):
+            pass
+        else:
+            fv = self.get_forward_value(node)
+            node.interval = (fv, fv)
+            if isinstance(fv, torch.Tensor):
+                node.lower, node.upper = node.interval
+            return node.interval
 
     to_be_deleted_bounds = []
     if not hasattr(node, 'interval'):
@@ -54,6 +63,15 @@ def IBP_general(self: 'BoundedModule', node=None, C=None,
                     n, delete_bounds_after_use=delete_bounds_after_use)
                 to_be_deleted_bounds.append(n)
         inp = [n_pre.interval for n_pre in node.inputs]
+        # ``aten::zeros`` buffers may receive in-place ``copy_`` writes from nodes
+        # that are not SSA inputs of ``zeros``; ensure value intervals exist first.
+        if type(node).__name__ == 'BoundATenOnnxZeros':
+            pending = getattr(node, '_pending_inplace_writes', None) or []
+            for copy_node in pending:
+                val_node = copy_node.inputs[1]
+                if not hasattr(val_node, 'interval'):
+                    self.IBP_general(
+                        val_node, delete_bounds_after_use=delete_bounds_after_use)
         if (C is not None and isinstance(node, BoundLinear)
                 and not node.is_input_perturbed(1)):
             # merge the last BoundLinear node with the specification, available
@@ -64,11 +82,19 @@ def IBP_general(self: 'BoundedModule', node=None, C=None,
         else:
             node.interval = node.interval_propagate(*inp)
 
-        node.lower, node.upper = node.interval
+        lo, up = node.interval[0], node.interval[1]
+        if not isinstance(lo, torch.Tensor):
+            node.lower = node.upper = None
+            return node.interval
+        node.lower, node.upper = lo, up
         if isinstance(node.lower, torch.Size):
             node.lower = torch.tensor(node.lower)
         if isinstance(node.upper, torch.Size):
             node.upper = torch.tensor(node.upper)
+        if not isinstance(node.lower, torch.Tensor):
+            # Metadata intervals (lists, strings, scalars) are not tensor boxes.
+            node.lower = node.upper = None
+            return node.interval
 
         # Handle NaNs in lower and upper bounds
         if torch.isnan(node.lower).any():

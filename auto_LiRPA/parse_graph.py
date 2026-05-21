@@ -252,7 +252,14 @@ def update_debug_names(trace_graph):
                 output.setDebugName(f"{output.debugName()}_{parse_source(n)}")
                 visited.append(output.debugName())
 
-def parse_module(module, inputs, param_exclude=".*AuxLogits.*", param_include=None):
+def parse_module(
+    module,
+    inputs,
+    param_exclude=".*AuxLogits.*",
+    param_include=None,
+    onnx_optimize_graph=True,
+    jit_assign_rewrite=False,
+):
     params = _get_jit_params(module, param_exclude=param_exclude, param_include=param_include)
     try:
         trace, out = torch.jit._get_trace_graph(module, inputs)
@@ -281,26 +288,34 @@ def parse_module(module, inputs, param_exclude=".*AuxLogits.*", param_include=No
     logger.debug("Graph before ONNX convertion:")
     logger.debug(trace)
 
-    # Assuming that the first node in the graph is the primary input node.
-    # It must have a batch dimension.
-    primary_input = get_node_name(next(iter(trace.inputs())))
-    trace_graph = _optimize_graph(
-        trace, torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
-        params_dict={},
-        input_names=[primary_input],
-        dynamic_axes={primary_input: {0: 'batch'}})
-    logger.debug('trace_graph: %s', trace_graph)
+    if onnx_optimize_graph:
+        # Assuming that the first node in the graph is the primary input node.
+        # It must have a batch dimension.
+        primary_input = get_node_name(next(iter(trace.inputs())))
+        graph = _optimize_graph(
+            trace, torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK,
+            params_dict={},
+            input_names=[primary_input],
+            dynamic_axes={primary_input: {0: 'batch'}})
+        logger.debug('trace_graph: %s', graph)
 
-    if os.environ.get('AUTOLIRPA_DEBUG_NAMES', 0):
-        update_debug_names(trace_graph)
+        if os.environ.get('AUTOLIRPA_DEBUG_NAMES', 0):
+            update_debug_names(graph)
 
-    logger.debug("ONNX graph:")
-    logger.debug(trace_graph)
+        logger.debug("ONNX graph:")
+        logger.debug(graph)
+    else:
+        logger.debug("Using raw JIT graph (onnx_optimize_graph=False)")
+        graph = trace
 
     if not isinstance(inputs, tuple):
         inputs = (inputs, )
 
-    nodesOP, nodesIn, nodesOut = parse_graph(trace_graph, tuple(inputs), tuple(params))
+    nodesOP, nodesIn, nodesOut = parse_graph(graph, tuple(inputs), tuple(params))
+
+    if not onnx_optimize_graph and jit_assign_rewrite:
+        from .jit_graph import rewrite_inplace_copy_to_assign
+        nodesOP, nodesOut = rewrite_inplace_copy_to_assign(nodesOP, nodesOut)
 
     for i in range(len(nodesOP)):
         param_in = OrderedDict()

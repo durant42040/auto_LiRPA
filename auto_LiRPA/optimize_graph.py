@@ -42,6 +42,10 @@ def _optimize_graph(self: 'BoundedModule'):
         self.bound_opts['optimize_graph']['optimizer'](self)
 
     for node in list(self.nodes()):
+        if type(node).__name__ == 'BoundAtenJitCopy':
+            # Side-effect-only ``copy_`` nodes have no SSA consumers but must
+            # stay alive for ``register_inplace_buffer_writes``.
+            continue
         if (not node.output_name
                 and node.name != self.final_name
                 and node.name not in self.root_names):

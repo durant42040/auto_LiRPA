@@ -9,8 +9,8 @@ operator names such as ``fft_irfftn`` where ``str.capitalize()`` does not
 produce a valid ``BoundATen...`` class name.
 
 ``operator="zeros"`` from ONNX passes shape/dtype as tensor arguments; that
-is routed to ``BoundATenOnnxZeros`` instead of ``BoundATenZeros`` (which expects
-``attr["shape"]`` from a different export path).
+is routed to the unified ``BoundZeros`` class, which also serves raw-JIT
+``aten::zeros``.
 """
 from __future__ import annotations
 
@@ -32,17 +32,17 @@ def resolve_aten_bound_class(attr: Dict[str, Any], globals_ns: Dict[str, Any]):
     if op == "Placeholder":
         name = attr.get("name", "")
         if name == "index_put_":
-            return globals_ns["BoundATenIndexPut"]
+            return globals_ns["BoundIndexPut"]
         raise KeyError(f"unsupported ATen Placeholder name={name!r}")
 
     # Explicit names where ``op.capitalize()`` is not the class suffix (e.g. fft_irfftn).
     if op == "fft_irfftn":
-        return globals_ns["BoundATenFftIrfftn"]
+        return globals_ns["BoundIRFFT"]
     if op == "fft_rfftn":
-        return globals_ns["BoundATenFftRfftn"]
+        return globals_ns["BoundRFFT"]
     # ONNX ATen fallback uses tensor arguments instead of attr["shape"] (see BoundATenZeros).
     if op == "zeros":
-        return globals_ns["BoundATenOnnxZeros"]
+        return globals_ns["BoundZeros"]
 
     cls_name = f"BoundATen{op.capitalize()}"
     if cls_name not in globals_ns:
@@ -52,22 +52,21 @@ def resolve_aten_bound_class(attr: Dict[str, Any], globals_ns: Dict[str, Any]):
 
 # Raw JIT ``aten::`` ops (when ``onnx_optimize_graph`` is False).
 _JIT_ATEN_MAP = {
-    "aten::zeros": "BoundATenOnnxZeros",
+    "aten::zeros": "BoundZeros",
     "aten::fft_rfftn": "BoundRFFT",
-    "aten::fft_irfftn": "BoundAtenJitFftIrfftn",
-    "aten::slice": "BoundAtenJitSlice",
-    "aten::einsum": "BoundAtenJitEinsum",
+    "aten::fft_irfftn": "BoundIRFFT",
+    "aten::slice": "BoundSlice",
+    "aten::einsum": "BoundComplexEinsum",
     "aten::clone": "BoundAtenClone",
-    "aten::expand": "BoundAtenExpand",
-    "aten::add": "BoundAtenJitAdd",
+    "aten::expand": "BoundExpand",
+    "aten::add": "BoundAdd",
     "aten::size": "BoundAtenJitSize",
     "aten::Int": "BoundAtenJitInt",
     "aten::floor_divide": "BoundAtenJitFloorDivide",
-    "aten::copy_": "BoundAtenJitCopy",
 }
 
 _JIT_PRIM_MAP = {
-    "prim::Constant": "BoundJitConstant",
+    "prim::Constant": "BoundConstant",
     "prim::ListConstruct": "BoundPrimListConstruct",
     "prim::NumToTensor": "BoundPrimNumToTensor",
 }

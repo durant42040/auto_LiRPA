@@ -188,12 +188,30 @@ class UnsqueezeGrad(Module):
 
 
 class BoundExpand(Bound):
+    """``onnx::Expand`` and raw-JIT ``aten::expand`` (Python-list sizes)."""
+
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)
         self.use_default_ibp = True
 
-    def forward(self, x, y):
-        y = y.clone()
+    @staticmethod
+    def _normalize_sizes(sizes):
+        """Return ``sizes`` as a 1-D ``LongTensor`` regardless of source dialect."""
+        if isinstance(sizes, torch.Tensor):
+            return sizes.reshape(-1).to(torch.int64).clone()
+        if isinstance(sizes, (list, tuple)):
+            flat = []
+            for s in sizes:
+                if isinstance(s, torch.Tensor):
+                    flat.extend(int(t) for t in s.reshape(-1).tolist())
+                else:
+                    flat.append(int(s))
+            return torch.tensor(flat, dtype=torch.int64)
+        return torch.tensor([int(sizes)], dtype=torch.int64)
+
+    def forward(self, x, y, *implicit):
+        del implicit
+        y = self._normalize_sizes(y)
         assert y.ndim == 1
         n, m = x.ndim, y.shape[0]
         assert n <= m
@@ -227,13 +245,13 @@ class BoundExpand(Bound):
         # It doesn't support general Expand operator.
         # This is just for the Expand operator converted from torch.repeat, and here
         # it should just be an identical operator.
-        shape = x[1].lb
+        shape = self._normalize_sizes(x[1].lb)
         if not (len(x[0].lb.shape) == len(shape) and (shape == 1).all()):
             raise NotImplementedError("General onnx::Expand is not supported")
         return x[0]      
 
     def build_gradient_node(self, grad_upstream):
-        shape = self.inputs[1].forward_value
+        shape = self._normalize_sizes(self.inputs[1].forward_value)
         if not (len(self.inputs[0].output_shape) == len(shape) and (shape == 1).all()):
             raise NotImplementedError("General onnx::Expand is not supported")
         return [(ExpandGrad(shape), (grad_upstream,), []), None]

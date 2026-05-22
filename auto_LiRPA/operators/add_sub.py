@@ -21,6 +21,8 @@ from .solver_utils import grb
 
 
 class BoundAdd(Bound):
+    """``onnx::Add`` and raw-JIT ``aten::add`` (optional ``alpha`` scalar input)."""
+
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)
         options = options or {}
@@ -28,13 +30,42 @@ class BoundAdd(Bound):
         # Instead we must traverse the graph and determine when patches mode needs to be used.
 
         self.mode = options.get("conv_mode", "matrix")
+        # JIT ``aten::add`` carries a third ``alpha`` operand (``out = x + alpha*y``);
+        # ONNX ``Add`` has only two.  Detect the JIT layout so we route the extra
+        # scalar slot through ``bound_backward``/``interval_propagate`` cleanly.
+        self._jit_layout = (attr or {}).get('_graph_op') == 'aten::add'
 
-    def forward(self, x, y):
+    @staticmethod
+    def _coerce_alpha(alpha):
+        if alpha is None:
+            return 1
+        if isinstance(alpha, torch.Tensor):
+            return alpha.item() if alpha.numel() == 1 else alpha
+        return alpha
+
+    def forward(self, x, y, alpha=1):
         self.x_shape = x.shape
         self.y_shape = y.shape
-        return x + y
+        alpha = self._coerce_alpha(alpha)
+        if alpha == 1:
+            return x + y
+        return x + y * alpha
 
-    def bound_backward(self, last_lA, last_uA, x, y, **kwargs):
+    def bound_backward(self, last_lA, last_uA, x, y, *extras, **kwargs):
+        if extras:
+            # ``extras[0]`` is the alpha-slot ``Bound`` node (e.g. a
+            # ``BoundConstant`` holding ``1`` for the JIT ``aten::add(x, y,
+            # alpha)`` form).  Read its scalar value, not the node itself.
+            alpha_node = extras[0]
+            alpha_val = getattr(
+                alpha_node, 'value', getattr(alpha_node, 'forward_value', alpha_node)
+            )
+            alpha = self._coerce_alpha(alpha_val)
+            if alpha != 1:
+                raise NotImplementedError(
+                    "BoundAdd CROWN with alpha != 1 is not supported."
+                )
+
         def _bound_oneside(last_A, w):
             if last_A is None:
                 return None
@@ -44,9 +75,18 @@ class BoundAdd(Bound):
         uA_y = _bound_oneside(last_uA, y)
         lA_x = _bound_oneside(last_lA, x)
         lA_y = _bound_oneside(last_lA, y)
-        return [(lA_x, uA_x), (lA_y, uA_y)], 0, 0
+        result = [(lA_x, uA_x), (lA_y, uA_y)]
+        if extras:
+            result.append((None, None))
+        return result, 0, 0
 
-    def bound_forward(self, dim_in, x, y):
+    def bound_forward(self, dim_in, x, y, *extras):
+        if extras:
+            alpha = self._coerce_alpha(getattr(extras[0], 'value', extras[0]))
+            if alpha != 1:
+                raise NotImplementedError(
+                    "BoundAdd bound_forward with alpha != 1 is not supported."
+                )
         lb, ub = x.lb + y.lb, x.ub + y.ub
 
         def add_w(x_w, y_w, x_b, y_b):
@@ -64,7 +104,14 @@ class BoundAdd(Bound):
 
         return LinearBound(lw, lb, uw, ub)
 
-    def interval_propagate(self, x, y):
+    def interval_propagate(self, x, y, *extras):
+        if extras:
+            alpha_l = self._coerce_alpha(extras[0][0])
+            alpha_u = self._coerce_alpha(extras[0][1])
+            if alpha_l != 1 or alpha_u != 1:
+                raise NotImplementedError(
+                    "BoundAdd IBP with alpha != 1 is not supported."
+                )
         assert (not isinstance(y, Tensor))
         return x[0] + y[0], x[1] + y[1]
 

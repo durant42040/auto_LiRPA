@@ -32,7 +32,7 @@ def _coerce_onnx_constant_value(value, device):
 class BoundConstant(Bound):
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)
-        self.value = _coerce_onnx_constant_value(attr['value'], self.device)
+        self.value = _coerce_onnx_constant_value(attr.get('value'), self.device)
         self.use_default_ibp = True
         self.no_jacobian = True
         if not isinstance(self.value, torch.Tensor):
@@ -87,11 +87,6 @@ class BoundConstant(Bound):
             self.solver_vars = self.value
         else:
             self.solver_vars = None
-
-
-class BoundPrimConstant(Bound):
-    def forward(self):
-        return torch.tensor([], device=self.device)
 
 
 class BoundConstantOfShape(Bound):

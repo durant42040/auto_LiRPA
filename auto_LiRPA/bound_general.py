@@ -104,10 +104,10 @@ class BoundedModule(nn.Module):
             # Whether to compute bounds for every node in the graph.
             # (rather than only the nodes whose intermediate bounds are needed.)
             'bound_every_node': False,
-            # If False, parse the raw JIT graph and rewrite in-place copy_ to custom::Assign
-            # (needed for FNO-style spectral writes). Default True preserves legacy behavior.
+            # If False, parse the raw JIT graph; in-place ``aten::copy_`` is then
+            # rewritten unconditionally to ``custom::Assign`` (needed for FNO-style
+            # spectral writes).  Default True preserves legacy behavior.
             'onnx_optimize_graph': True,
-            'jit_assign_rewrite': False,
         }
         default_bound_opts.update(bound_opts)
         self.bound_opts = default_bound_opts
@@ -580,7 +580,6 @@ class BoundedModule(nn.Module):
         self.perturbed_optimizable_activations = (
             self.get_perturbed_optimizable_activations())
         self._propagate_perturbed_through_list_construct()
-        self._mark_inplace_buffer_perturbation()
         self._propagate_perturbed_downstream()
         return
 
@@ -615,23 +614,6 @@ class BoundedModule(nn.Module):
                 if not nxt.never_perturbed and not nxt.perturbed:
                     nxt.perturbed = True
                     queue.append(nxt)
-
-    def _mark_inplace_buffer_perturbation(self):
-        """Mark ``zeros`` buffers perturbed when in-place ``copy_`` writes perturbed values.
-
-        ``copy_`` is not an SSA predecessor of the module output, so the usual
-        BFS in ``_mark_perturbed_nodes`` never reaches the buffer node.
-        """
-        for node in self.nodes():
-            if type(node).__name__ != 'BoundATenOnnxZeros':
-                continue
-            pending = getattr(node, '_pending_inplace_writes', None) or []
-            for copy_node in pending:
-                src = copy_node.inputs[1]
-                if src.perturbed:
-                    node.perturbed = True
-                    copy_node.perturbed = True
-                    break
 
     def _check_patches_mode(self):
         """Disable patches mode if there is no Conv node.
@@ -786,7 +768,6 @@ class BoundedModule(nn.Module):
             model,
             global_input_cpu,
             onnx_optimize_graph=self.bound_opts.get('onnx_optimize_graph', True),
-            jit_assign_rewrite=self.bound_opts.get('jit_assign_rewrite', False),
         )
         model.to(self.device)
         for i in range(0, len(nodesIn)):
@@ -839,6 +820,7 @@ class BoundedModule(nn.Module):
                              nodesOP[n])
                 continue
             attr['device'] = self.device
+            attr['_graph_op'] = nodesOP[n].op
 
             # FIXME generalize
             if (nodesOP[n].op == 'onnx::BatchNormalization'
@@ -991,33 +973,8 @@ class BoundedModule(nn.Module):
         # The name of the final node used in the last call to `compute_bounds`
         self.last_final_node_name = None
 
-        if not self.bound_opts.get('onnx_optimize_graph', True):
-            if not self.bound_opts.get('jit_assign_rewrite', False):
-                from .jit_graph import register_inplace_buffer_writes
-                register_inplace_buffer_writes(self)
-
         if self.verbose:
             logger.info('Model converted to support bounds')
-
-        self._warn_fused_index_put_graph()
-
-    def _warn_fused_index_put_graph(self):
-        """Warn when ONNX fused ``index_put_`` drops spectral write operands."""
-        if not self.bound_opts.get('onnx_optimize_graph', True):
-            return
-        for node in self.nodes():
-            if type(node).__name__ == 'BoundATenIndexPut' and len(node.inputs) == 1:
-                warnings.warn(
-                    'ONNX graph optimization fused index_put_ into a single-input op '
-                    '(only the base buffer remains). IBP/CROWN bounds apply to that '
-                    'reduced graph, not to the full eager SpectralConv / FNO forward. '
-                    'BoundedModule(x) may disagree with model(x). For FNO-style layers use '
-                    "bound_opts={'onnx_optimize_graph': False} once required JIT ops are "
-                    'supported, or implement sound index_put bounds on the ONNX path.',
-                    UserWarning,
-                    stacklevel=2,
-                )
-                return
 
     def check_prior_bounds(self, node, C=None):
         if node.prior_checked or not (node.used and node.perturbed):
@@ -1094,13 +1051,26 @@ class BoundedModule(nn.Module):
 
         if not node.perturbed:
             fv = self.get_forward_value(node)
-            node.interval = node.lower, node.upper = fv, fv
+            # JIT graphs route Python metadata (strings, ints, lists, ``None``)
+            # through ``Bound`` nodes (``aten::Int``, ``prim::ListConstruct``,
+            # ``prim::Constant``-string, etc.).  Skip the tensor-only ``lower``/
+            # ``upper`` setters for those; downstream consumers read
+            # ``forward_value`` directly.
+            if isinstance(fv, torch.Tensor):
+                node.interval = node.lower, node.upper = fv, fv
+            else:
+                node.lower = node.upper = None
+                node.interval = (None, None)
             return
 
         # FIXME check that weight perturbation is not affected
         #      (from_input=True should be set for weights)
         if not node.from_input and hasattr(node, 'forward_value'):
-            node.lower = node.upper = self.get_forward_value(node)
+            fv = self.get_forward_value(node)
+            if isinstance(fv, torch.Tensor):
+                node.lower = node.upper = fv
+            else:
+                node.lower = node.upper = None
             return
 
         reference_bounds = self.reference_bounds

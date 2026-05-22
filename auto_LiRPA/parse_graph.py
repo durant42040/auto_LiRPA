@@ -258,7 +258,6 @@ def parse_module(
     param_exclude=".*AuxLogits.*",
     param_include=None,
     onnx_optimize_graph=True,
-    jit_assign_rewrite=False,
 ):
     params = _get_jit_params(module, param_exclude=param_exclude, param_include=param_include)
     try:
@@ -313,7 +312,7 @@ def parse_module(
 
     nodesOP, nodesIn, nodesOut = parse_graph(graph, tuple(inputs), tuple(params))
 
-    if not onnx_optimize_graph and jit_assign_rewrite:
+    if not onnx_optimize_graph:
         from .jit_graph import rewrite_inplace_copy_to_assign
         nodesOP, nodesOut = rewrite_inplace_copy_to_assign(nodesOP, nodesOut)
 

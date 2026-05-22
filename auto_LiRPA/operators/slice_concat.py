@@ -144,6 +144,13 @@ BoundConcatFromSequence = BoundConcat
 
 
 class BoundSlice(Bound):
+    """``onnx::Slice`` and raw-JIT ``aten::slice`` in a single class.
+
+    ONNX layout: ``forward(x, start, end, axes, steps)`` with parameters either
+    in ``attr["starts"]/["ends"]/["axes"]`` or as 5 ``BoundConstant`` inputs.
+    JIT layout: ``forward(x, dim, start, end, step)`` with all 5 as inputs.
+    """
+
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)
         self.start = attr["starts"][0] if "starts" in attr else None
@@ -151,17 +158,48 @@ class BoundSlice(Bound):
         self.axes = attr["axes"][0] if "axes" in attr else None
         self.use_default_ibp = False
         self.ibp_intermediate = True
+        self._jit_layout = attr.get("_graph_op") == "aten::slice"
 
     def __repr__(self):
         attrs = {}
         if (len(self.inputs) == 5
             and all(isinstance(item, BoundConstant) and item.value.numel() == 1
                     for item in self.inputs[1:])):
-            attrs['start'] = self.inputs[1].value.item()
-            attrs['end'] = self.inputs[2].value.item()
-            attrs['axes'] = self.inputs[3].value.item()
-            attrs['step'] = self.inputs[4].value.item()
+            if self._jit_layout:
+                attrs['dim'] = self.inputs[1].value.item()
+                attrs['start'] = self.inputs[2].value.item()
+                attrs['end'] = self.inputs[3].value.item()
+                attrs['step'] = self.inputs[4].value.item()
+            else:
+                attrs['start'] = self.inputs[1].value.item()
+                attrs['end'] = self.inputs[2].value.item()
+                attrs['axes'] = self.inputs[3].value.item()
+                attrs['step'] = self.inputs[4].value.item()
         return super().__repr__(attrs)
+
+    @staticmethod
+    def _as_int(v):
+        if isinstance(v, torch.Tensor):
+            return int(v.reshape(-1)[0].item())
+        return int(v)
+
+    def _normalize_args(self, x, start=None, end=None, axes=None, steps=1):
+        """Reorder JIT ``(dim, start, end, step)`` into ONNX ``(start, end, axes, steps)``.
+
+        JIT also encodes "to end of dimension" as ``end > 2**62`` (``INT_MAX``).
+        """
+        if self._jit_layout:
+            dim = start
+            jstart = end
+            jend = axes
+            jstep = 1 if steps is None else steps
+            shape = x.shape if isinstance(x, Tensor) else [len(x)]
+            dim_i = self._as_int(dim)
+            jend_i = self._as_int(jend) if jend is not None else shape[dim_i]
+            if jend_i > 2**62:
+                jend_i = shape[dim_i]
+            return jstart, jend_i, dim_i, self._as_int(jstep)
+        return start, end, axes, steps
 
     def _fixup_params(self, shape, start, end, axes, steps):
         if start < 0:
@@ -178,6 +216,7 @@ class BoundSlice(Bound):
 
     # Older Pytorch version only passes steps as input.
     def forward(self, x, start=None, end=None, axes=None, steps=1):
+        start, end, axes, steps = self._normalize_args(x, start, end, axes, steps)
         start = self.start if start is None else start
         end = self.end if end is None else end
         axes = self.axes if axes is None else axes
@@ -197,6 +236,36 @@ class BoundSlice(Bound):
     def build_solver(self, *v, model, C=None, model_type="mip", solver_pkg="gurobi"):
         self.solver_vars = self.forward(*v)
 
+    def _resolve_input_params(self, x):
+        """Extract ``(start, end, axes, steps)`` from the 5-input bound nodes.
+
+        Tolerates both ``BoundConstant`` (``.value`` is a 0-D ``torch.Tensor``)
+        and JIT scalar-int producers like ``BoundAtenJitInt`` (``.value`` is a
+        Python ``int``).
+        """
+        def _scalar(node):
+            v = getattr(node, 'value', None)
+            if v is None:
+                v = getattr(node, 'forward_value', None)
+            if isinstance(v, torch.Tensor):
+                return v.item()
+            return v
+        if self._jit_layout:
+            dim_i = _scalar(x[1])
+            start_i = _scalar(x[2])
+            end_i = _scalar(x[3])
+            steps = _scalar(x[4]) if len(x) == 5 else 1
+            shape = self.input_shape
+            if end_i > 2**62:
+                end_i = shape[dim_i]
+            return start_i, end_i, dim_i, steps
+        return (
+            _scalar(x[1]),
+            _scalar(x[2]),
+            _scalar(x[3]),
+            _scalar(x[4]) if len(x) == 5 else 1,
+        )
+
     def bound_backward(self, last_lA, last_uA, *x, **kwargs):
         def _bound_oneside(A, start, end, axes, steps):
             if A is None:
@@ -204,7 +273,7 @@ class BoundSlice(Bound):
             if isinstance(A, torch.Tensor):
                 # Reuse the batch and spec dimension of A, and replace other shapes with input.
                 A_shape = A.shape[:2] + self.input_shape[1:]
-                new_A = torch.zeros(size=A_shape, device=A.device,
+                new_A = torch.zeros(size=A_shape, device=A.device, dtype=A.dtype,
                                     requires_grad=A.requires_grad)
                 # Fill part of the new_A based on start, end, axes and steps.
                 # Skip the spec dimension at the front (axes + 1).
@@ -228,8 +297,7 @@ class BoundSlice(Bound):
                 raise ValueError(f'Unsupport A type {type(A)}')
             return new_A
 
-        start, end, axes = x[1].value.item(), x[2].value.item(), x[3].value.item()
-        steps = x[4].value.item() if len(x) == 5 else 1  # If step is not specified, it is 1.
+        start, end, axes, steps = self._resolve_input_params(x)
         # Other step size untested, do not enable for now.
         assert steps == 1 and axes == int(axes) and start == int(start) and end == int(end)
         start, end = self._fixup_params(self.input_shape, start, end, axes, steps)
@@ -240,11 +308,19 @@ class BoundSlice(Bound):
 
     def bound_forward(self, dim_in, *inputs):
         assert len(inputs) == 5 or len(inputs) == 4
-        start = inputs[1].lb.item()
-        end = inputs[2].lb.item()
-        axis = self.make_axis_non_negative(inputs[3].lb.item())
+        if self._jit_layout:
+            axis = self.make_axis_non_negative(inputs[1].lb.item())
+            start = inputs[2].lb.item()
+            end = inputs[3].lb.item()
+            steps = inputs[4].lb.item() if len(inputs) == 5 else 1
+            if end > 2**62:
+                end = inputs[0].lb.shape[axis]
+        else:
+            start = inputs[1].lb.item()
+            end = inputs[2].lb.item()
+            axis = self.make_axis_non_negative(inputs[3].lb.item())
+            steps = inputs[4].lb.item() if len(inputs) == 5 else 1
         assert axis > 0, "Slicing along the batch dimension is not supported yet"
-        steps = inputs[4].lb.item() if len(inputs) == 5 else 1  # If step is not specified, it is 1.
         assert steps in [1, -1]
         x = inputs[0]
         shape = x.lb.shape
@@ -262,10 +338,7 @@ class BoundSlice(Bound):
 
     def build_gradient_node(self, grad_upstream):
         assert len(self.inputs) == 5
-        start = self.inputs[1].value.item()
-        end = self.inputs[2].value.item()
-        axes = self.inputs[3].value.item()
-        steps = self.inputs[4].value.item()
+        start, end, axes, steps = self._resolve_input_params(self.inputs)
         assert steps == 1
         node_grad = SliceGrad(start, end, axes, steps)
         grad_input = (grad_upstream, self.inputs[0].forward_value)

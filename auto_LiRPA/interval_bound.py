@@ -63,15 +63,6 @@ def IBP_general(self: 'BoundedModule', node=None, C=None,
                     n, delete_bounds_after_use=delete_bounds_after_use)
                 to_be_deleted_bounds.append(n)
         inp = [n_pre.interval for n_pre in node.inputs]
-        # ``aten::zeros`` buffers may receive in-place ``copy_`` writes from nodes
-        # that are not SSA inputs of ``zeros``; ensure value intervals exist first.
-        if type(node).__name__ == 'BoundATenOnnxZeros':
-            pending = getattr(node, '_pending_inplace_writes', None) or []
-            for copy_node in pending:
-                val_node = copy_node.inputs[1]
-                if not hasattr(val_node, 'interval'):
-                    self.IBP_general(
-                        val_node, delete_bounds_after_use=delete_bounds_after_use)
         if (C is not None and isinstance(node, BoundLinear)
                 and not node.is_input_perturbed(1)):
             # merge the last BoundLinear node with the specification, available

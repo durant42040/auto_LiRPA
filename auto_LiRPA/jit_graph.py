@@ -60,13 +60,15 @@ def rewrite_inplace_copy_to_assign(
     """
     by = _node_by_name(nodesOP)
     rewire: Dict[str, str] = {}
-    assign_nodes: List[Node] = []
     slice_targets: Set[str] = set()
-    kept: List[Node] = []
+    # Map original ``aten::copy_`` index in ``nodesOP`` → its replacement
+    # ``custom::Assign`` ``Node``.  Inserting in-place preserves topological
+    # order so downstream consumers (e.g. ``aten::fft_irfftn`` reading the
+    # rewired buffer) appear after the assign node in ``nodesOP``.
+    assigns_by_idx: Dict[int, Node] = {}
 
-    for n in nodesOP:
+    for idx, n in enumerate(nodesOP):
         if n.op != "aten::copy_":
-            kept.append(n)
             continue
         dest_view, src, _non_blocking = n.inputs[0], n.inputs[1], n.inputs[2]
         base_name, chain = _slice_chain_nodes(dest_view, by)
@@ -76,23 +78,25 @@ def rewrite_inplace_copy_to_assign(
             slice_chain = _ordered_slice_specs(dest_view, by)
         except ValueError:
             slice_chain = []
-        assign_nodes.append(
-            Node(
-                name=assign_name,
-                ori_name=None,
-                inputs=[base_name, src],
-                attr={"slice_chain": slice_chain},
-                op="custom::Assign",
-                param={},
-                input_index=None,
-                bound_node=None,
-                output_index=0,
-                perturbation=None,
-            )
+        # ``dest_view`` is the deepest slice in the write chain.  We keep it as
+        # a metadata input so ``BoundIndexPut`` can resolve the slice indices
+        # lazily at forward time when ``_ordered_slice_specs`` could not.
+        assign_inputs = [base_name, src, dest_view] if dest_view != base_name else [base_name, src]
+        assigns_by_idx[idx] = Node(
+            name=assign_name,
+            ori_name=None,
+            inputs=assign_inputs,
+            attr={"slice_chain": slice_chain},
+            op="custom::Assign",
+            param={},
+            input_index=None,
+            bound_node=None,
+            output_index=0,
+            perturbation=None,
         )
         rewire[base_name] = assign_name
 
-    if not assign_nodes:
+    if not assigns_by_idx:
         return nodesOP, nodesOut
 
     def map_inputs(inputs: List[str], node_name: str) -> List[str]:
@@ -105,11 +109,11 @@ def rewrite_inplace_copy_to_assign(
         return mapped
 
     out: List[Node] = []
-    for n in kept + assign_nodes:
-        if n.op == "custom::Assign":
-            out.append(n)
-        else:
-            out.append(n._replace(inputs=map_inputs(list(n.inputs), n.name)))
+    for idx, n in enumerate(nodesOP):
+        if n.op == "aten::copy_":
+            out.append(assigns_by_idx[idx])
+            continue
+        out.append(n._replace(inputs=map_inputs(list(n.inputs), n.name)))
 
     if nodesOut is not None:
         nodesOut = [rewire.get(o, o) for o in nodesOut]
@@ -117,33 +121,3 @@ def rewrite_inplace_copy_to_assign(
     return out, nodesOut
 
 
-def _bound_buffer_base(dest_view):
-    """Root buffer node for a JIT slice view chain."""
-    cur = dest_view
-    while type(cur).__name__ == "BoundAtenJitSlice":
-        cur = cur.inputs[0]
-    return cur
-
-
-def register_inplace_buffer_writes(model) -> None:
-    """Register ``aten::copy_`` side effects on the buffer they mutate.
-
-    JIT graphs use ``copy_`` into a slice of a ``zeros`` buffer while ``irfftn`` reads
-    the buffer node directly, so ``copy_`` has no SSA consumers and is dropped by graph
-    optimization. LiRPA runs pending writes when the base buffer's forward value is
-    first materialized.
-    """
-    from .operators.aten_fallback import BoundAtenJitCopy
-
-    for node in list(model.nodes()):
-        if not isinstance(node, BoundAtenJitCopy):
-            continue
-        dest_view = node.inputs[0]
-        base = _bound_buffer_base(dest_view)
-        node._inplace_base = base
-        pending = getattr(base, "_pending_inplace_writes", None)
-        if pending is None:
-            pending = []
-            base._pending_inplace_writes = pending
-        if node not in pending:
-            pending.append(node)

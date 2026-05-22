@@ -251,10 +251,19 @@ def backward_general(
             self.backward_from[l.name].append(bound_node)
 
             if not l.perturbed:
-                if not hasattr(l, 'forward_value'):
-                    self.get_forward_value(l)
-                lb, ub = add_constant_node(lb, ub, l)
-                continue
+                # Container nodes (``prim::ListConstruct`` etc.) are
+                # ``never_perturbed`` metadata, but their consumers (e.g.
+                # ``BoundComplexEinsum``) hand them a *packed* tuple/list of
+                # per-element ``A`` tensors that must be unpacked back onto
+                # the perturbed source.  Route through ``bound_backward``
+                # whenever the upstream ``A`` is non-tensor structured.
+                lA_packed = isinstance(l.lA, (list, tuple))
+                uA_packed = isinstance(l.uA, (list, tuple))
+                if not (lA_packed or uA_packed):
+                    if not hasattr(l, 'forward_value'):
+                        self.get_forward_value(l)
+                    lb, ub = add_constant_node(lb, ub, l)
+                    continue
 
             if l.zero_uA_mtx and l.zero_lA_mtx:
                 # A matrices are all zero, no need to propagate.
@@ -747,8 +756,16 @@ def add_bound(node, node_pre, lA=None, uA=None):
 
 
 def add_constant_node(lb, ub, node):
-    new_lb = node.get_bias(node.lA, node.forward_value)
-    new_ub = node.get_bias(node.uA, node.forward_value)
+    fv = node.forward_value
+    # JIT graphs carry Python metadata (strings, ints, lists, ``None``) through
+    # constant-like ``Bound`` nodes (``prim::ListConstruct``, ``prim::Constant``-
+    # string, ``aten::Int``, ...).  These never contribute a tensor bias to the
+    # CROWN summation; producers route ``(None, None)`` adjoints to them so
+    # ``node.lA`` / ``node.uA`` are ``None`` here.  Skip the bias add.
+    if not isinstance(fv, Tensor):
+        return lb, ub
+    new_lb = node.get_bias(node.lA, fv)
+    new_ub = node.get_bias(node.uA, fv)
     if isinstance(lb, Tensor) and isinstance(new_lb, Tensor) and lb.ndim > 0 and lb.ndim != new_lb.ndim:
         new_lb = new_lb.reshape(lb.shape)
     if isinstance(ub, Tensor) and isinstance(new_ub, Tensor) and ub.ndim > 0 and ub.ndim != new_ub.ndim:

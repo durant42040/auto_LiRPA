@@ -395,6 +395,18 @@ class BoundGelu(BoundTanh):
         return pl, pu
 
 
+class BoundAtenJitGelu(BoundGelu):
+    """Raw-JIT ``aten::gelu`` adapter that ignores approximation metadata."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        super().__init__(
+            attr, inputs[:1] if inputs is not None else inputs, output_index, options
+        )
+
+    def forward(self, x, approximate=None):
+        return F.gelu(x, approximate="none")
+
+
 class GELUOp(torch.autograd.Function):
     sqrt_2 = math.sqrt(2)
     sqrt_2pi = math.sqrt(2 * math.pi)

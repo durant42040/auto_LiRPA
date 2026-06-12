@@ -95,9 +95,21 @@ class BoundReshape(Bound):
         return LinearBound(w, b, w, b, x_L=x.x_L, x_U=x.x_U, tot_dim=x.tot_dim)
 
     def interval_propagate(self, *v):
+        shape = v[1][0]
+        if shape is None:
+            shape = getattr(
+                self.inputs[1], "forward_value", getattr(self.inputs[1], "value", None)
+            )
+            if shape is None:
+                shape = self.inputs[1].forward(
+                    *[
+                        getattr(inp, "forward_value", getattr(inp, "value", None))
+                        for inp in self.inputs[1].inputs
+                    ]
+                )
         return Interval.make_interval(
-            self.forward(v[0][0], v[1][0]),
-            self.forward(v[0][1], v[1][0]), v[0])
+            self.forward(v[0][0], shape),
+            self.forward(v[0][1], shape), v[0])
 
     def build_solver(self, *v, model, C=None, model_type="mip", solver_pkg="gurobi"):
         if isinstance(v[0], Tensor):

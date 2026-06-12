@@ -108,6 +108,11 @@ class Bound(nn.Module):
     Base class for supporting the bound computation of an operator. Please see examples
     at `auto_LiRPA/operators`.
 
+    Class attributes:
+        propagates_perturbed_inputs: when ``True``, the perturbation BFS marks
+            downstream consumers as perturbed if any input is perturbed, even
+            though this node itself may stay ``never_perturbed``.
+
     Args:
         attr (dict): Attributes of the operator.
 
@@ -120,6 +125,7 @@ class Bound(nn.Module):
     Be sure to run `super().__init__(attr, inputs, output_index, options, device)`
     first in the `__init__` function.
     """
+    propagates_perturbed_inputs = False
 
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__()

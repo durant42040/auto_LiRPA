@@ -469,6 +469,94 @@ class BoundConv(Bound):
         self._check_weight_perturbation()
 
 
+def _jit_const_value(node):
+    """Best-effort materialization for raw-JIT metadata nodes."""
+    if node is None:
+        return None
+    if hasattr(node, 'forward_value') and node.forward_value is not None:
+        return node.forward_value
+    if hasattr(node, 'param'):
+        return node.param
+    if hasattr(node, 'buffer'):
+        return node.buffer
+    if hasattr(node, 'value'):
+        return node.value
+    if hasattr(node, 'inputs'):
+        values = [_jit_const_value(inp) for inp in node.inputs]
+        return node.forward(*values)
+    return node
+
+
+def _jit_int_list(node):
+    value = _jit_const_value(node)
+    if isinstance(value, torch.Tensor):
+        return [int(v) for v in value.reshape(-1).tolist()]
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            if isinstance(item, torch.Tensor):
+                out.extend(int(v) for v in item.reshape(-1).tolist())
+            else:
+                out.append(int(item))
+        return out
+    return [int(value)]
+
+
+def _jit_bool(node):
+    value = _jit_const_value(node)
+    if isinstance(value, torch.Tensor):
+        return bool(value.reshape(-1)[0].item())
+    return bool(value)
+
+
+class BoundAtenJitConvolution(BoundConv):
+    """Raw-JIT ``aten::_convolution`` adapter for fixed-weight 1D FNO blocks."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        if inputs is None or len(inputs) < 9:
+            raise NotImplementedError(
+                "BoundAtenJitConvolution expects the raw aten::_convolution signature."
+            )
+
+        weight = _jit_const_value(inputs[1])
+        if weight is None:
+            raise NotImplementedError(
+                "BoundAtenJitConvolution requires a fixed convolution weight."
+            )
+        if weight.ndim != 3:
+            raise NotImplementedError(
+                "BoundAtenJitConvolution currently supports Conv1d only."
+            )
+
+        bias = _jit_const_value(inputs[2])
+        conv_inputs = [inputs[0], inputs[1]]
+        if bias is not None:
+            conv_inputs.append(inputs[2])
+
+        if _jit_bool(inputs[6]):
+            raise NotImplementedError(
+                "BoundAtenJitConvolution does not support transposed convolutions."
+            )
+
+        padding = _jit_int_list(inputs[4])
+        if len(padding) != 1:
+            raise NotImplementedError(
+                "BoundAtenJitConvolution currently supports 1D padding only."
+            )
+
+        conv_attr = {
+            'kernel_shape': list(weight.shape[2:]),
+            'pads': [padding[0], padding[0]],
+            'strides': _jit_int_list(inputs[3]),
+            'dilations': _jit_int_list(inputs[5]),
+            'group': int(_jit_const_value(inputs[8])),
+        }
+        conv_options = dict(options or {})
+        conv_options['conv_mode'] = 'matrix'
+        super().__init__(conv_attr, conv_inputs, output_index, conv_options)
+        self.patches_start = False
+
+
 class BoundConvTranspose(Bound):
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)

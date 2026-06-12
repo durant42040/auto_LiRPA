@@ -557,6 +557,10 @@ class BoundedModule(nn.Module):
             # We set the relu here to ensure the list is sorted according to topological order.
             if isinstance(node, BoundRelu):
                 relus.append(node)
+            propagates_perturbation = node.perturbed or (
+                node.propagates_perturbed_inputs
+                and any(inp.perturbed for inp in node.inputs)
+            )
             # Obtain all output node, and add the output nodes to the queue if
             # all its input nodes have been visited.
             # The initial "perturbed" property is set in BoundInput or
@@ -566,7 +570,9 @@ class BoundedModule(nn.Module):
                 if not node_next.never_perturbed:
                     # The next node is perturbed if it is already perturbed,
                     # or this node is perturbed.
-                    node_next.perturbed = node_next.perturbed or node.perturbed
+                    node_next.perturbed = (
+                        node_next.perturbed or propagates_perturbation
+                    )
                 degree_in[name_next] -= 1
                 # all inputs of this node have been visited,
                 # now put it in queue.
@@ -579,41 +585,7 @@ class BoundedModule(nn.Module):
         self.splittable_activations = self.get_splittable_activations()
         self.perturbed_optimizable_activations = (
             self.get_perturbed_optimizable_activations())
-        self._propagate_perturbed_through_list_construct()
-        self._propagate_perturbed_downstream()
         return
-
-    def _propagate_perturbed_through_list_construct(self):
-        """Mark ``aten::einsum`` (etc.) when operands arrive via ``prim::ListConstruct``.
-
-        ``BoundPrimListConstruct`` is ``never_perturbed``, so the main BFS does not
-        forward the flag from sliced RFFT outputs to their list consumers.
-        """
-        changed = True
-        while changed:
-            changed = False
-            for node in self.nodes():
-                if type(node).__name__ != 'BoundPrimListConstruct':
-                    continue
-                if not any(inp.perturbed for inp in node.inputs):
-                    continue
-                for name_next in node.output_name:
-                    nxt = self[name_next]
-                    if nxt.never_perturbed or nxt.perturbed:
-                        continue
-                    nxt.perturbed = True
-                    changed = True
-
-    def _propagate_perturbed_downstream(self):
-        """BFS from all perturbed nodes (e.g. ``zeros`` after in-place ``copy_``)."""
-        queue = deque(n for n in self.nodes() if n.perturbed)
-        while queue:
-            node = queue.popleft()
-            for name_next in node.output_name:
-                nxt = self[name_next]
-                if not nxt.never_perturbed and not nxt.perturbed:
-                    nxt.perturbed = True
-                    queue.append(nxt)
 
     def _check_patches_mode(self):
         """Disable patches mode if there is no Conv node.

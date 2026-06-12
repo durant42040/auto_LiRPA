@@ -190,7 +190,8 @@ def parse_graph(graph, inputs, params):
     return canonicalize_onnx_nodes(nodesOP), nodesIn, nodesOut
 
 def _get_jit_params(module, param_exclude, param_include):
-    state_dict = torch.jit._unique_state_dict(module, keep_vars=True)
+    state_dict = _tensor_only_state_dict(
+        torch.jit._unique_state_dict(module, keep_vars=True))
 
     if param_exclude is not None:
         param_exclude = re.compile(param_exclude)
@@ -209,6 +210,20 @@ def _get_jit_params(module, param_exclude, param_include):
     params = zip(new_state_dict.keys(), new_state_dict.values())
 
     return params
+
+
+def _tensor_only_state_dict(state_dict):
+    """Drop non-tensor state entries before handing parameters to JIT/LiRPA.
+
+    Some third-party modules, including NeuralOperator's FNO, attach Python
+    metadata to ``state_dict()``. PyTorch tracing appends state values to the
+    traced inputs, so non-tensor entries must be removed consistently from both
+    the trace-time state and auto_LiRPA's parsed parameter list.
+    """
+
+    return OrderedDict(
+        (k, v) for k, v in state_dict.items() if isinstance(v, torch.Tensor)
+    )
 
 def get_output_template(out):
     """Construct a template for the module output with `None` representing places
@@ -260,13 +275,23 @@ def parse_module(
     onnx_optimize_graph=True,
 ):
     params = _get_jit_params(module, param_exclude=param_exclude, param_include=param_include)
+    import torch.jit._trace as torch_jit_trace
+    original_unique_state_dict = torch_jit_trace._unique_state_dict
+
+    def tensor_only_unique_state_dict(module, keep_vars=False):
+        return _tensor_only_state_dict(
+            original_unique_state_dict(module, keep_vars=keep_vars))
+
     try:
+        torch_jit_trace._unique_state_dict = tensor_only_unique_state_dict
         trace, out = torch.jit._get_trace_graph(module, inputs)
     except:
         print(traceback.format_exc())
         raise RuntimeError(
             'Failed to get the trace. '
             'Please check that the model and inputs are compatible with torch.jit.')
+    finally:
+        torch_jit_trace._unique_state_dict = original_unique_state_dict
 
     if version.parse(torch.__version__) < version.parse("2.0.0"):
         from torch.onnx.symbolic_helper import _set_opset_version

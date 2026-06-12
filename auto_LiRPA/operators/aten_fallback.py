@@ -3,8 +3,6 @@
 #########################################################################
 """``Bound`` subclasses for selected ``aten::ATen`` ONNX-fallback nodes."""
 
-import warnings
-
 import torch
 
 from .base import Bound, Interval
@@ -91,22 +89,12 @@ class BoundZeros(Bound):
         return torch.zeros(*shape_list, dtype=dtype, device=dev, requires_grad=rg)
 
     def interval_propagate(self, shape, scalar_type=None, layout=None, device=None, requires_grad=None):
-        def _bound(iv):
-            if iv is None:
-                return None
-            return iv[0]
-
-        args_l = [_bound(shape), _bound(scalar_type), _bound(layout), _bound(device), _bound(requires_grad)]
-        args_u = [
-            shape[1] if shape is not None else None,
-            scalar_type[1] if scalar_type is not None else None,
-            layout[1] if layout is not None else None,
-            device[1] if device is not None else None,
-            requires_grad[1] if requires_grad is not None else None,
-        ]
-        o_l = self.forward(*args_l)
-        o_u = self.forward(*args_u)
-        return Interval.make_interval(o_l, o_u, shape)
+        del layout, requires_grad
+        shape_l = shape[0] if shape is not None else None
+        scalar_l = scalar_type[0] if scalar_type is not None else None
+        device_l = device[0] if device is not None else None
+        out = self.forward(shape_l, scalar_l, None, device_l, False)
+        return Interval.make_interval(out, out, shape)
 
 
 def _norm_arg(norm):
@@ -210,32 +198,20 @@ class BoundAtenClone(Bound):
 
 
 class BoundIndexPut(Bound):
-    """Unified ``index_put`` / slice-assign bound for all three graph dialects.
+    """Slice-chain assign bound for raw-JIT ``custom::Assign`` nodes.
 
-    Four input shapes are handled by a single class, selected from
-    ``len(inputs)`` and ``attr`` at forward / IBP time:
+    Raw-JIT graphs rewrite ``aten::copy_`` into ``custom::Assign``, which
+    dispatches here.  Two input shapes are supported:
 
-    1. **Slice-chain form, static** (post ``custom::Assign`` rewrite of raw-JIT
-       ``aten::copy_`` when slice indices were resolvable from the JIT graph):
-       ``inputs = [base, src]`` with ``attr["slice_chain"]`` providing the
-       ``(dim, start, end, step)`` write region.
-    2. **Slice-chain form, lazy** (rewrite path when JIT slice indices depend
-       on dynamic shape, e.g. ``aten::size``):
-       ``inputs = [base, src, dest_view]`` where ``dest_view`` is the deepest
-       slice in the destination chain.  The slice chain is resolved at the
-       first forward call by walking ``dest_view`` upward through the
-       ``BoundSlice`` ancestors.
-    3. **ONNX-fused 1-input passthrough**: ONNX optimization may drop the
-       index/values operands, leaving ``inputs = [base]``.  The class then
-       returns ``base`` unchanged and emits a ``UserWarning`` since this case
-       is **not sound** for FNO-style spectral writes.
-    4. **ONNX functional form** (``aten::ATen[Placeholder, name=index_put_]``):
-       ``inputs = [base, *index_tensors, values, accumulate]`` (4+ inputs).
-       Lowered to ``torch.index_put``.
+    1. **Static slice chain** — ``inputs = [base, src]`` with
+       ``attr["slice_chain"]`` providing the ``(dim, start, end, step)`` write
+       region resolved at graph-parse time.
+    2. **Lazy slice chain** — ``inputs = [base, src, dest_view]`` when slice
+       indices depend on dynamic shape metadata; the chain is resolved on the
+       first forward call by walking ``dest_view`` through ``BoundSlice`` nodes.
 
-    CROWN backward currently supports the slice-chain form (Phase A: only the
-    ``src`` / ``values`` input may be perturbed); other forms raise
-    ``NotImplementedError``.
+    CROWN backward supports the slice-chain form with an unperturbed base buffer
+    only; the perturbed ``src`` input receives the gathered cotangent.
     """
 
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
@@ -245,18 +221,11 @@ class BoundIndexPut(Bound):
         self._slices_inferred = bool(self.slices)
         self._slice_chain_resolved = bool(self.slice_chain)
         self.use_default_ibp = False
-        # ``inputs`` is the list of producer ``Bound`` nodes; we use its
-        # length to pick the calling-convention at forward/IBP time.
         self._n_inputs = len(inputs) if inputs is not None else 0
-        if self._n_inputs == 1:
-            warnings.warn(
-                "BoundIndexPut: ONNX optimization fused index_put_ into a "
-                "single-input op (only the base buffer remains).  Bounds "
-                "apply to that reduced graph, not the full eager forward.  "
-                "For FNO-style layers use bound_opts={'onnx_optimize_graph': "
-                "False} so the slice-assign is preserved as a custom::Assign.",
-                UserWarning,
-                stacklevel=2,
+        if self._n_inputs not in (2, 3):
+            raise NotImplementedError(
+                "BoundIndexPut expects the slice-chain form with 2 or 3 inputs; "
+                f"got {self._n_inputs}.  Use bound_opts={{'onnx_optimize_graph': False}}."
             )
 
     @staticmethod
@@ -345,123 +314,68 @@ class BoundIndexPut(Bound):
             out = values.clone()
         return out
 
-    # -- ONNX functional helpers ---------------------------------------------
-
-    @staticmethod
-    def _forward_onnx(self_tensor, index_tensors, values, accumulate):
-        if isinstance(accumulate, torch.Tensor) and accumulate.numel() == 1:
-            accumulate = bool(accumulate.item())
-        else:
-            accumulate = bool(accumulate)
-        return torch.index_put(
-            self_tensor, list(index_tensors), values, accumulate=accumulate
-        )
-
     # -- forward / IBP / CROWN ------------------------------------------------
 
-    @staticmethod
-    def _is_slice_chain_form(n_inputs):
-        """``inputs = [base, src]`` (2) or ``[base, src, dest_view]`` (3)."""
-        return n_inputs in (2, 3)
-
     def forward(self, *inputs):
-        if len(inputs) == 1:
-            return inputs[0]
-        if self._is_slice_chain_form(len(inputs)):
-            self._ensure_slice_chain()
-            return self._forward_slice_chain(inputs[0], inputs[1])
-        # ONNX functional: (base, *indices, values, accumulate)
-        return self._forward_onnx(
-            inputs[0], inputs[1:-2], inputs[-2], inputs[-1]
-        )
+        self._ensure_slice_chain()
+        return self._forward_slice_chain(inputs[0], inputs[1])
 
     def interval_propagate(self, *v):
-        if len(v) == 1:
-            return v[0][0], v[0][1]
-        if self._is_slice_chain_form(len(v)):
-            self._ensure_slice_chain()
-            if self.is_input_perturbed(0):
-                raise NotImplementedError(
-                    "BoundIndexPut Phase A requires an unperturbed base buffer."
-                )
-            base_l, base_u = v[0][0], v[0][1]
-            val_l, val_u = v[1][0], v[1][1]
-            if self.slice_chain:
-                o_l = self._write_via_slice_chain(base_l.clone(), val_l)
-                o_u = self._write_via_slice_chain(base_u.clone(), val_u)
-                return Interval.make_interval(o_l, o_u, v[1])
-            if not self._slices_inferred:
-                self._maybe_infer_slices(base_l, val_l)
-            if not self.slices:
-                return Interval.make_interval(val_l, val_u, v[1])
-            idx = _slice_index(self.slices)
-            o_l = base_l.clone()
-            o_u = base_u.clone()
-            o_l[idx] = val_l
-            o_u[idx] = val_u
-            return Interval.make_interval(o_l, o_u, v[1])
-        # ONNX functional form.
+        self._ensure_slice_chain()
         if self.is_input_perturbed(0):
             raise NotImplementedError(
-                "BoundIndexPut Phase A requires an unperturbed base tensor."
+                "BoundIndexPut requires an unperturbed base buffer."
             )
         base_l, base_u = v[0][0], v[0][1]
-        val_l, val_u = v[-2][0], v[-2][1]
-        idx_lower = [x[0] for x in v[1:-2]]
-        out_l = self._forward_onnx(base_l, idx_lower, val_l, v[-1][0])
-        out_u = self._forward_onnx(base_u, idx_lower, val_u, v[-1][0])
-        return Interval.make_interval(out_l, out_u, v[-2])
+        val_l, val_u = v[1][0], v[1][1]
+        if self.slice_chain:
+            o_l = self._write_via_slice_chain(base_l.clone(), val_l)
+            o_u = self._write_via_slice_chain(base_u.clone(), val_u)
+            return Interval.make_interval(o_l, o_u, v[1])
+        if not self._slices_inferred:
+            self._maybe_infer_slices(base_l, val_l)
+        if not self.slices:
+            return Interval.make_interval(val_l, val_u, v[1])
+        idx = _slice_index(self.slices)
+        o_l = base_l.clone()
+        o_u = base_u.clone()
+        o_l[idx] = val_l
+        o_u[idx] = val_u
+        return Interval.make_interval(o_l, o_u, v[1])
 
     def bound_backward(self, last_lA, last_uA, *inputs, **kwargs):
         del kwargs
-        if len(inputs) == 1:
-            return [(last_lA, last_uA)], 0, 0
-        if self._is_slice_chain_form(len(inputs)):
-            self._ensure_slice_chain()
+        self._ensure_slice_chain()
 
-            def _to_values(A):
-                """Extract ``A`` along the slice chain into the values cotangent.
+        def _to_values(A):
+            """Gather the cotangent along the written slice chain."""
+            if A is None:
+                return None
+            if isinstance(A, torch.Tensor):
+                view = A
+                for dim, start, end, step in self.slice_chain:
+                    a_dim = dim + 1
+                    shape_dim = view.shape[a_dim]
+                    end_i = shape_dim if end > 2**62 else end
+                    if start < 0:
+                        start = shape_dim + start
+                    length = end_i - start
+                    view = torch.narrow(view, a_dim, start, length)
+                    if step == -1:
+                        view = torch.flip(view, dims=(a_dim,))
+                if self.slice_chain:
+                    return view.contiguous()
+                if self.slices:
+                    idx = _slice_index(self.slices)
+                    return A[idx]
+                return A
+            raise NotImplementedError(
+                f"BoundIndexPut: unsupported A type {type(A)}"
+            )
 
-                ``base[chain] = values`` is linear in ``values`` with the
-                "scatter into chain" map; the adjoint w.r.t. ``values`` is
-                the inverse "gather along chain", i.e. successive
-                ``narrow`` / ``flip`` calls along the same dims.  ``A`` has a
-                leading specification axis (CROWN convention), so the
-                graph-level ``dim`` shifts by ``+1`` to address ``A``'s axes.
-                """
-                if A is None:
-                    return None
-                if isinstance(A, torch.Tensor):
-                    view = A
-                    for dim, start, end, step in self.slice_chain:
-                        a_dim = dim + 1
-                        shape_dim = view.shape[a_dim]
-                        end_i = shape_dim if end > 2**62 else end
-                        if start < 0:
-                            start = shape_dim + start
-                        length = end_i - start
-                        view = torch.narrow(view, a_dim, start, length)
-                        if step == -1:
-                            view = torch.flip(view, dims=(a_dim,))
-                    if self.slice_chain:
-                        return view.contiguous()
-                    if self.slices:
-                        idx = _slice_index(self.slices)
-                        return A[idx]
-                    return A
-                raise NotImplementedError(
-                    f"BoundIndexPut: unsupported A type {type(A)}"
-                )
-
-            ret = [(None, None)] * len(inputs)
-            ret[1] = (_to_values(last_lA), _to_values(last_uA))
-            return ret, 0, 0
-        # ONNX functional form: CROWN through general indices not implemented.
-        raise NotImplementedError(
-            "BoundIndexPut.bound_backward for the ONNX functional form is not "
-            "implemented; use bound_opts={'onnx_optimize_graph': False} so the "
-            "slice-assign is preserved as a custom::Assign."
-        )
+        ret = [(None, None)] * len(inputs)
+        ret[1] = (_to_values(last_lA), _to_values(last_uA))
+        return ret, 0, 0
 
 
 class BoundAtenJitSize(Bound):
@@ -525,8 +439,90 @@ class BoundAtenJitFloorDivide(Bound):
         return torch.tensor(a_i // b_i, device=self.device, dtype=torch.int64)
 
 
+class BoundAtenJitSub(Bound):
+    """``aten::sub`` on shape scalars (JIT metadata path)."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        super().__init__(attr, inputs, output_index, options)
+        self.use_default_ibp = True
+        self.no_jacobian = True
+        self.never_perturbed = True
+
+    def forward(self, a, b, alpha=None):
+        del alpha
+        a_i = int(a.item() if isinstance(a, torch.Tensor) else a)
+        b_i = int(b.item() if isinstance(b, torch.Tensor) else b)
+        return torch.tensor(a_i - b_i, device=self.device, dtype=torch.int64)
+
+
+class BoundAtenJitRemainder(Bound):
+    """``aten::remainder`` on shape scalars (JIT metadata path)."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        super().__init__(attr, inputs, output_index, options)
+        self.use_default_ibp = True
+        self.no_jacobian = True
+        self.never_perturbed = True
+
+    def forward(self, a, b):
+        a_i = int(a.item() if isinstance(a, torch.Tensor) else a)
+        b_i = int(b.item() if isinstance(b, torch.Tensor) else b)
+        return torch.tensor(a_i % b_i, device=self.device, dtype=torch.int64)
+
+
+class BoundFftShift(Bound):
+    """``aten::fft_fftshift`` — permutation along FFT frequency axes."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        super().__init__(attr, inputs, output_index, options)
+        self.use_default_ibp = False
+
+    @staticmethod
+    def _resolve_dims(dim):
+        if dim is None:
+            return None
+        if isinstance(dim, torch.Tensor):
+            if dim.numel() == 0:
+                return None
+            return [int(x) for x in dim.reshape(-1).tolist()]
+        if isinstance(dim, (list, tuple)):
+            return [int(x) for x in dim]
+        return int(dim)
+
+    def forward(self, x, dim=None):
+        dims = self._resolve_dims(dim)
+        if dims is None:
+            return torch.fft.fftshift(x)
+        return torch.fft.fftshift(x, dim=dims)
+
+    def interval_propagate(self, x_iv, dim=None):
+        dim_arg = dim[0] if isinstance(dim, (list, tuple)) and len(dim) == 2 else dim
+        dims = self._resolve_dims(dim_arg)
+        lower = torch.fft.fftshift(x_iv[0], dim=dims)
+        upper = torch.fft.fftshift(x_iv[1], dim=dims)
+        return Interval.make_interval(lower, upper, x_iv)
+
+    def bound_backward(self, last_lA, last_uA, *inputs, **kwargs):
+        del kwargs
+        dim = inputs[1] if len(inputs) > 1 else None
+        dims = self._resolve_dims(getattr(dim, "forward_value", dim))
+
+        def _adjoint(A):
+            if A is None:
+                return None
+            if dims is None:
+                return torch.fft.ifftshift(A)
+            return torch.fft.ifftshift(A, dim=dims)
+
+        lA = _adjoint(last_lA)
+        uA = _adjoint(last_uA)
+        return [(lA, uA), (None, None)], 0, 0
+
+
 class BoundPrimListConstruct(Bound):
     """``prim::ListConstruct`` for JIT shape lists (feeds ``aten::zeros`` etc.)."""
+
+    propagates_perturbed_inputs = True
 
     def __init__(self, attr=None, inputs=None, output_index=0, options=None):
         super().__init__(attr, inputs, output_index, options)

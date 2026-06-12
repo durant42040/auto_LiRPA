@@ -44,8 +44,8 @@ def IBP_general(self: 'BoundedModule', node=None, C=None,
     if not node.perturbed:
         # ``prim::ListConstruct`` for ``aten::einsum`` operands: keep
         # ``perturbed=False`` but still box tensor intervals from inputs.
-        if type(node).__name__ == 'BoundPrimListConstruct' and any(
-                getattr(inp, 'perturbed', False) for inp in node.inputs):
+        if node.propagates_perturbed_inputs and any(
+                inp.perturbed for inp in node.inputs):
             pass
         else:
             fv = self.get_forward_value(node)

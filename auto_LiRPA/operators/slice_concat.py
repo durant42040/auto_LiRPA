@@ -143,6 +143,69 @@ class BoundConcat(Bound):
 BoundConcatFromSequence = BoundConcat
 
 
+class BoundAtenJitCat(Bound):
+    """Raw-JIT ``aten::cat`` where tensors arrive as one ListConstruct input."""
+
+    def __init__(self, attr=None, inputs=None, output_index=0, options=None):
+        super().__init__(attr, inputs, output_index, options)
+        self.axis = None
+        self.input_size = None
+        self.ibp_intermediate = True
+
+    @staticmethod
+    def _as_int(value):
+        if isinstance(value, Tensor):
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def forward(self, tensors, dim=0):
+        self.axis = self.make_axis_non_negative(self._as_int(dim))
+        self.input_size = [item.shape[self.axis] for item in tensors]
+        return torch.cat(list(tensors), dim=self.axis)
+
+    def interval_propagate(self, *v):
+        tensors_l, tensors_u = v[0]
+        dim = v[1][0]
+        if tensors_l is None:
+            tensors_l, tensors_u = [], []
+            for inp in self.inputs[0].inputs:
+                interval = getattr(inp, "interval", None)
+                if interval is None:
+                    value = getattr(inp, "forward_value", getattr(inp, "value", None))
+                    tensors_l.append(value)
+                    tensors_u.append(value)
+                else:
+                    tensors_l.append(interval[0])
+                    tensors_u.append(interval[1])
+        if dim is None:
+            dim = getattr(self.inputs[1], "forward_value", getattr(self.inputs[1], "value", 0))
+        return Interval.make_interval(
+            self.forward(tensors_l, dim),
+            self.forward(tensors_u, dim), v[0])
+
+    def bound_backward(self, last_lA, last_uA, tensors, dim, **kwargs):
+        del tensors, dim, kwargs
+        self.axis = self.make_axis_non_negative(self.axis, 'output')
+        assert self.axis > 0
+
+        def _bound_oneside(last_A):
+            if last_A is None:
+                return None
+            ret = list(torch.split(last_A, self.input_size, dim=self.axis + 1))
+            return tuple(None if (item == 0).all() else item for item in ret)
+
+        lA = _bound_oneside(last_lA)
+        uA = _bound_oneside(last_uA)
+        if lA is not None and uA is not None:
+            lA = tuple(
+                torch.zeros_like(uA[i]) if item is None and uA[i] is not None else item
+                for i, item in enumerate(lA))
+            uA = tuple(
+                torch.zeros_like(lA[i]) if item is None and lA[i] is not None else item
+                for i, item in enumerate(uA))
+        return [(lA, uA), (None, None)], 0, 0
+
+
 class BoundSlice(Bound):
     """``onnx::Slice`` and raw-JIT ``aten::slice`` in a single class.
 
